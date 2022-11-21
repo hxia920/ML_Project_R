@@ -1,0 +1,572 @@
+---
+title: "Final Project"
+author: "Haoyuan Xia & Yiyang Zhou"
+date: "2022-09-25"
+output: html_document
+---
+
+```{r knitr_init, echo=FALSE, cache=FALSE,include=FALSE}
+Sys.setenv(LANGUAGE = "en")
+
+# library(devtools)
+# devtools::install_github("andrie/deepviz")
+# library(deepviz)
+# library(magrittr)
+
+library(knitr)
+library(gt)
+library(data.table)
+library(psych)
+library(leaps)
+library(caret)
+library(tidyverse)
+library(naniar)
+library(glmnet)
+library(MASS)
+library(reticulate)
+library(keras)
+library(tfdatasets)
+library(randomForest)
+library(vtable)
+
+## Global options
+options(max.print="150") 
+opts_chunk$set(echo=TRUE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=120)
+```
+
+
+#0. Read in and Clean the Dataset
+```{r}
+rm(list=ls())
+census <- read.csv("census_tract_data.csv")
+
+# Delete index column
+census <- census %>% dplyr::select(-X)
+
+# Delete NA obs
+sum(is.na(census))
+png(filename = "vis_miss.png" ,
+    width = 1618, height = 1000)
+vis_miss(census, warn_large_data = FALSE)
+dev.off()
+census = na.omit(census)  
+
+# Drop duplicated observations (only keep the first one)
+dup <- census$CensusTract[duplicated(census$CensusTract)]
+census <- distinct(census, CensusTract, .keep_all = TRUE)
+
+# Transform census tract to state fips and county fips
+census$CensusTract <- as.character(census$CensusTract)
+census$CensusTract <- str_pad(census$CensusTract, 11, side = 'left', '0')
+census$StateID <- as.factor(substr(census$CensusTract, 1, 2))
+census$CountyID <- as.factor(substr(census$CensusTract, 3, 5))
+census$CensusTract <- as.factor(census$CensusTract)
+
+#Delete CensusTract, State name and County name
+census <- census %>% dplyr::select(-State, -County)
+
+# Create training and test dataset
+set.seed(53705)
+
+# 75%: training data, 25%: test data
+trainIndex <- createDataPartition(census$MeanCommute, p = .75, 
+                                  list = FALSE, 
+                                  times = 1)
+
+train <- census[ trainIndex,]
+test  <- census[-trainIndex,]
+
+nrow(train)
+nrow(test)
+
+train_notrue <- train %>% dplyr::select(-MeanCommute)
+test_notrue <- test %>% dplyr::select(-MeanCommute)
+
+# Adjust train and test data
+train <- train %>% dplyr::select(-CensusTract, -StateID, -CountyID, -IncomePerCapErr)
+test <- test %>% dplyr::select(-CensusTract, -StateID, -CountyID, -IncomePerCapErr)
+train_notrue <- train_notrue %>% dplyr::select(-CensusTract, -StateID, -CountyID, -IncomePerCapErr)
+test_notrue <- test_notrue %>% dplyr::select(-CensusTract, -StateID, -CountyID, -IncomePerCapErr)
+
+```
+#0.1 Descriptive Statistics
+```{r}
+census.desc_stat <- census %>% dplyr::select(-CensusTract, -StateID, -CountyID, -IncomePerCapErr)
+
+st(census.desc_stat,
+   summ = list(
+     c('notNA(x)','mean(x)','sd(x^2)','min(x)','max(x)')
+   ),
+   summ.names = list(
+     c('N','Mean','SD','Min','Max')
+   ),
+   out='latex',file='census.table.tex')
+
+```
+
+#1. Baseline results: OLS regression with best subset selection
+```{r}
+regfit.full <- regsubsets(MeanCommute~., train, force.out = c('Men', 'White', 'IncomePerCap', 'Professional', 'PublicWork'), nvmax = 20) # default nvmax = 8 # RSS
+summary(regfit.full)
+
+```
+##1.1 CV best model selection
+```{r}
+regfit.best <- regsubsets(MeanCommute~., train, force.out = c('Men', 'White', 'IncomePerCap', 'Professional', 'PublicWork'), nvmax = 20)
+
+form <- {}
+coefi <- {}
+
+for (i in 1:20) {
+  coefi <- coef(regfit.full,i)
+  form[i] <- "MeanCommute ~"
+  
+  for (j in 1:i) {
+    form[i] <- paste(form[i],names(coefi[j+1]))
+    if (j < i){
+      form[i] <- paste(form[i],'+')
+    }
+  }
+}
+
+set.seed(53703)
+model.ols <- list()
+
+# Fit lm model using 5 x 5-fold CV: model
+for (i in 1:20) {
+  model.ols[[i]] <- train(
+    formula(form[i]), 
+    train,
+    method = "lm",
+    trControl = trainControl(
+      method = "repeatedcv", 
+      number = 5, 
+      repeats = 5, 
+      verboseIter = FALSE
+    )
+  )
+}
+
+# Print model to console
+
+cv_rmse <- {}
+
+for (i in 1:20) {
+  print(model.ols[[i]]$results$RMSE)
+  cv_rmse[i] <- model.ols[[i]]$results$RMSE
+}
+
+best_num_vars <- which.min(cv_rmse)
+best_num_vars
+min(cv_rmse)
+form[which.min(cv_rmse)]
+```
+##1.2 Visualize CV best model selection
+```{r}
+num_vars = c(1:20)
+df.ols_cv_rmse = as.data.frame(cbind(num_vars, cv_rmse))
+df.ols_cv_rmse <- as.data.frame(lapply(df.ols_cv_rmse, unlist))
+ggplot(df.ols_cv_rmse, aes(x = num_vars, y = cv_rmse)) + 
+  geom_line() + geom_point(size=2) +
+  geom_vline(aes(xintercept = best_num_vars), colour="#BB0000", linetype="dashed") +
+  scale_x_continuous(breaks = seq(1,20))+
+  labs(x='Number of Predictors',y='RMSE')+
+  theme_test(base_size = 20)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))
+
+```
+
+##1.3 Re-estimate the final model on whole training set, use it to make prediction on test set
+```{r}
+final_model.ols <- lm(formula(form[best_num_vars]),train)
+summary(final_model.ols)
+
+# RMSE on test set
+pred <- predict(final_model.ols,test)
+sqrt(mean((pred - test$MeanCommute)^2))
+
+df_ols.pred = as.data.frame(cbind(test$MeanCommute, pred))
+df_ols.pred <- as.data.frame(lapply(df_ols.pred, unlist))
+
+ggplot(df_ols.pred, aes(x = test$MeanCommute, y = pred)) + geom_point(size=1) +
+  geom_abline(col = "red")+
+  scale_x_continuous(breaks = seq(10,60,10))+
+  scale_y_continuous(breaks = seq(10,60,10))+
+  labs(x='Mean Commute Time',y='Prediction')+
+  theme_test(base_size = 20)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))
+```
+
+#2. Random Forest Results
+```{r}
+tuneGrid <- expand.grid(.mtry = c(4:15), .splitrule = "variance", .min.node.size = c(4:10))
+
+# Fit random forest: model
+    rf_model <- train(MeanCommute ~ ., tuneLength = 1, data = train,
+    metric = "RMSE", 
+    method = "ranger", 
+    tuneGrid = tuneGrid,
+    seed = 53705,
+    trControl = trainControl(method = "cv",
+                            number = 5, 
+                            verboseIter = FALSE, 
+                            ))
+    
+plot(rf_model)
+saveRDS(rf_model, "D:/GraduateSchool/UWMadison/AAE 722 Fall 2022/final_project/rf_model_cv.rds")
+```
+
+
+##2.1 Optimal Tuning Parameters Visualization
+```{r}
+# Mtry and min.node.size
+opt_param <- ggplot(rf_model)
+opt_param + geom_vline(aes(xintercept = rf_model$bestTune$mtry), colour="#BB0000", linetype="dashed") + 
+  scale_x_continuous(breaks = seq(4, 15, by = 1)) +
+  labs(x='Number of Randomly Selected Predictors',y='RMSE(Cross-Validation)')+
+  theme_test(base_size = 15)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.3, .9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))+
+  theme(plot.title = element_text(hjust = 0.5))
+opt_param
+
+set.seed(53705)
+rf_final_model <- randomForest(formula = MeanCommute ~ ., 
+                               mtry = rf_model$bestTune$mtry,
+                               splitrule = rf_model$bestTune$splitrule,
+                               nodesize = rf_model$bestTune$min.node.size, 
+                               ntree = 1000,
+                               importance = TRUE,
+                               data = train)
+
+saveRDS(rf_final_model, "D:/GraduateSchool/UWMadison/AAE 722 Fall 2022/final_project/rf_final_model.rds")
+
+#Number of Trees
+num_trees = plot(rf_final_model, family = 'serif', font = 2, cex.axis = 1.5, cex.lab = 1.5, main = '', ylim = c(30,60)) + abline(v = 400, col = 'red', lty = 3)
+num_trees
+
+
+num_trees = seq(1:1000)
+rf_rmse = lapply(rf_final_model$mse, sqrt)
+df_num_trees = as.data.frame(cbind(num_trees, rf_rmse))
+df_num_trees <- as.data.frame(lapply(df_num_trees, unlist))
+
+ggplot(df_num_trees, aes(x = num_trees, y = rf_rmse)) + geom_line() + 
+  geom_vline(aes(xintercept = 400), colour="#BB0000", linetype="dashed") +
+  scale_x_continuous(breaks = seq(0,1000,100))+
+  scale_y_continuous(breaks = seq(5,20,5))+
+  labs(x='Number of Trees',y='RMSE')+
+  theme_test(base_size = 20)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))
+
+#Importance of Predictors
+impToPlot <- randomForest::importance(rf_final_model)
+df_rf.varimp <- as.data.frame(impToPlot)
+df_rf.varimp$var_names <- rownames(df_rf.varimp)
+
+
+df_rf.varimp$var_names <- factor(df_rf.varimp$var_names, levels = df_rf.varimp$var_names[order(df_rf.varimp$`%IncMSE`)])
+
+ggplot(df_rf.varimp, aes(x = var_names, y = `%IncMSE`)) + geom_bar(stat='identity') +
+  coord_flip()+
+  labs(x='Predictor',y='Importance(%IncMSE)')+
+  theme_test(base_size = 15)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 18,color = 'black'))+
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+##2.2 Make Prediction on Test Set
+```{r}
+test_predictions <- rf_final_model %>%
+    predict(test %>%
+        dplyr::select(-MeanCommute))
+
+caret::RMSE(test_predictions, test$MeanCommute)
+
+df_rf.pred = as.data.frame(cbind(test$MeanCommute, test_predictions))
+df_rf.pred <- as.data.frame(lapply(df_rf.pred, unlist))
+
+ggplot(df_rf.pred, aes(x = test$MeanCommute, y = test_predictions)) + geom_point(size=1) +
+  geom_abline(col = "red")+
+  scale_x_continuous(breaks = seq(10,60,10))+
+  scale_y_continuous(breaks = seq(10,60,10))+
+  labs(x='Mean Commute Time',y='Prediction')+
+  theme_test(base_size = 20)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))
+```
+
+
+#3. Neural Network Results
+```{r}
+set.seed(53705)
+nn.train <- as_tibble(train)
+nn.test <- as_tibble(test)
+
+# Scale the data here
+spec <- feature_spec(nn.train, MeanCommute ~ .) %>%
+    step_numeric_column(all_numeric(), normalizer_fn = scaler_standard()) %>%
+    fit()
+
+#Define the neural network
+model <- keras_model_sequential()
+
+input <- layer_input_from_dataset(nn.train %>%
+    dplyr::select(-MeanCommute))
+
+output_layer <- list()
+
+output_layer[[1]] <- input %>%
+    layer_dense_features(dense_features(spec)) %>%
+    layer_dense(units = 17, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 1)
+
+output_layer[[2]] <- input %>%
+    layer_dense_features(dense_features(spec)) %>%
+    layer_dense(units = 17, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 9, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 1)
+
+output_layer[[3]] <- input %>%
+    layer_dense_features(dense_features(spec)) %>%
+    layer_dense(units = 21, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 14, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 7, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 1)
+
+output_layer[[4]] <- input %>%
+    layer_dense_features(dense_features(spec)) %>%
+    layer_dense(units = 20, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 15, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 10, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 5, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 1)
+
+output_layer[[5]] <- input %>%
+    layer_dense_features(dense_features(spec)) %>%
+    layer_dense(units = 21, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 17, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 13, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 9, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 5, activation = "relu") %>%
+    layer_dropout(rate = 0.05) %>%
+    layer_dense(units = 1)
+
+
+# Display training progress by printing a single dot for each completed epoch.
+print_dot_callback <- callback_lambda(
+  on_epoch_end = function(epoch, logs) {
+    if (epoch %% 50 == 0) cat("\n")
+    cat(".")
+  }
+)    
+
+# The patience parameter is the amount of epochs to check for improvement.
+early_stop <- callback_early_stopping(monitor = "val_loss", patience = 50)
+
+model_layer <- list()
+history_layer <- list()
+for (i in 1:5) {
+  model_layer[[i]] <- keras_model(input, output_layer[[i]])
+  model_layer[[i]] %>% 
+  compile(
+    loss = "mse",
+    optimizer = optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+  history_layer[[i]] <- model_layer[[i]] %>% fit(
+  x = nn.train %>% dplyr::select(-MeanCommute),
+  y = nn.train$MeanCommute,
+  epochs = 300,
+  #batch_size = 32,
+  validation_split = 0.2,
+  verbose = 0,
+  use_multiprocessing=TRUE,
+  callbacks = list(print_dot_callback) #, early_stop)
+)
+}
+
+
+
+# Find the neural network that has the lowest RMSE on train set
+
+train_predictions <- list()
+RMSE <- list()
+for (i in 1:5) {
+  train_predictions[[i]] <- model_layer[[i]] %>%
+    predict(nn.train %>%
+        dplyr::select(-MeanCommute))
+  RMSE[[i]] <- caret::RMSE(train_predictions[[i]][, 1], train$MeanCommute)
+}
+
+best_layer <- which.min(RMSE)
+best_layer
+RMSE[[best_layer]]
+plot(history_layer[[best_layer]])
+
+save.image(file = "final_project_nn.RData")
+```
+
+##3.1 Visualize the RMSE of the model with each layer
+```{r}
+num_layers = c(1:5)
+df_nn.rmse = as.data.frame(cbind(num_layers, RMSE))
+df_nn.rmse <- as.data.frame(lapply(df_nn.rmse, unlist))
+ggplot(df_nn.rmse, aes(x = num_layers, y = RMSE)) + 
+  geom_line() + geom_point(size=2) +
+  geom_vline(aes(xintercept = best_layer), colour="#BB0000", linetype="dashed") +
+  scale_x_continuous(breaks = seq(1,5))+
+  labs(x='Number of Layers',y='RMSE')+
+  theme_test(base_size = 20)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))
+
+```
+
+
+##3.2 Visualize the Training Process
+```{r}
+
+val_loss_history <- history_layer[[best_layer]]$metrics$val_loss
+  
+val_mae_history <- history_layer[[best_layer]]$metrics$val_mean_absolute_error
+
+val_mse_history <- data.frame(
+  epoch = seq(1:300),
+  validation_mse = val_loss_history
+)
+
+val_mae_history <- data.frame(
+  epoch = seq(1:300),
+  validation_mae = val_mae_history
+)
+
+ggplot(val_mse_history, aes(x = epoch, y = validation_mse)) + geom_line() + 
+  scale_x_continuous(breaks = seq(0,300,50))+
+  scale_y_continuous(breaks = seq(25,60,5))+
+  labs(x='Number of Epochs',y='Validation MSE')+
+  theme_test(base_size = 20)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))
+
+ggplot(val_mae_history, aes(x = epoch, y = validation_mae)) + geom_line() + 
+  scale_x_continuous(breaks = seq(0,300,50))+
+  scale_y_continuous(breaks = seq(4, 6, 0.2))+
+  labs(x='Number of Epochs',y='Validation MAE')+
+  theme_test(base_size = 20)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))
+
+```
+
+##3.3 Generate Neural Network using the optimal number of layers
+```{r}
+set.seed(53705)
+
+nn_final_model <- keras_model(input, output_layer[[best_layer]])
+  nn_final_model %>% 
+  compile(
+    loss = "mse",
+    optimizer = optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+  
+  summary(nn_final_model)
+  save_model_hdf5(nn_final_model, 'nn_final_model.h5')
+  
+```
+
+
+##3.3 Visualize the performance on the test set
+```{r}
+
+test_predictions <- nn_final_model %>%
+    predict(test %>%
+        dplyr::select(-MeanCommute))
+
+caret::RMSE(test_predictions[, 1], test$MeanCommute)
+
+df_nn.pred = as.data.frame(cbind(test$MeanCommute, test_predictions))
+df_nn.pred <- as.data.frame(lapply(df_nn.pred, unlist))
+
+ggplot(df_nn.pred, aes(x = test$MeanCommute, y = test_predictions)) + geom_point(size=1) +
+  geom_abline(col = "red")+
+  scale_x_continuous(breaks = seq(10,60,10))+
+  scale_y_continuous(breaks = seq(10,60,10))+
+  labs(x='Mean Commute Time',y='Prediction')+
+  theme_test(base_size = 20)+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(family = 'serif'),
+        legend.position = c(.2,.9),
+        legend.direction = "horizontal",
+        axis.text = element_text(color = 'black',family = 'serif'),
+        axis.title = element_text(family = 'serif',size = 16,color = 'black'))
+```
+
+
+
+
+
